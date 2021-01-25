@@ -4,6 +4,13 @@
 #include <WiFi.h>
 #endif
 
+#include <AsyncUDP.h>
+
+
+//EEPROM to store queue
+#include <EEPROM.h>
+
+
 //General Arduino Libraries
 #include <Arduino.h>
 
@@ -34,6 +41,9 @@
 // photoresistor connect one side to (+Vcc 5V) and the other side to the GPIO specified below
 #define lightSensor 34
 
+// define the number of bytes I want to access in EEPROM
+#define EEPROM_SIZE 2
+
 hw_timer_t * timer_1ms = NULL;
 hw_timer_t * timer_20ms = NULL;
 hw_timer_t * timer_100ms = NULL;
@@ -44,7 +54,7 @@ int interruptCounter20ms = 0;
 int interruptCounter100ms = 0;
 int interruptCounter1s = 0;
 
-IPAddress ip;
+String ip;
 
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
   
@@ -67,10 +77,23 @@ uint16_t dspColor = myWHITE;
 
 uint16_t myCOLORS[8] = {myRED, myGREEN, myBLUE, myWHITE, myYELLOW, myCYAN, myMAGENTA, myBLACK};
 
+// declarations for queue
+char series[]={'A','B','C','D','E','F','G','H','I','J'};
+uint8_t series_n;
+uint16_t counter=0;
+String showDSP;
+boolean callOnce_b;
+
+
+// declarations for display
 String p_name,p_value,text,Error;
 uint8_t Xpos,Ypos,Size;
 uint16_t Color;
 boolean b_text;
+
+// declarations for intervals
+unsigned long previousMillis = 0;       // will store last time LED was updated
+const long interval = 5000;             // interval at which to send udp boadcast (milliseconds)
 
 
 #if !( defined(ESP8266) || defined(ESP32) )
@@ -122,17 +145,12 @@ void configModeCallback (AsyncWiFiManager *myWiFiManager) {
   Serial.println(myWiFiManager->getConfigPortalSSID());
 }
 
-String IpAddress2String(const IPAddress& ipAddress)
-{
-  return String(ipAddress[0]) + String(".") +\
-  String(ipAddress[1]) + String(".") +\
-  String(ipAddress[2]) + String(".") +\
-  String(ipAddress[3])  ; 
-}
 
 
 AsyncWebServer server(80);
 DNSServer dns;
+AsyncUDP udp;
+
 
 void setup() {
   // put your setup code here, to run once:
@@ -161,18 +179,160 @@ void setup() {
   }
 
   //if you get here you have connected to the WiFi
-  Serial.println("connected...yeey :)");
+  Serial.println("connected...");
 
-    ip = WiFi.localIP();
+    ip = WiFi.localIP().toString();
     Serial.print("IP address: ");
     Serial.println(ip);
     
+    IPAddress broadcastIp = WiFi.localIP();
+    broadcastIp[3] = 255;
+    
+    udp.connect(broadcastIp, 19700);
+
+
+
     display.begin(16);
     display.setBrightness(10);
-    printText(IpAddress2String(ip),0,0,1,myWHITE);
+    printText(ip,0,0,1,myWHITE);
+
+      // initialize EEPROM with predefined size
+      EEPROM.begin(EEPROM_SIZE);
+
+      // get the last counter number from EEPROM
+      counter = EEPROM.read(0);
+      series_n = EEPROM.read(1);
+
+      // EEPROM initializes to 255 first time it is used
+      if (counter==255) counter=0;
+      if (series_n==255) series_n=0;
+
+      server.on("/", HTTP_GET, [&](AsyncWebServerRequest *request){
+        request->send(200, "text/html","<html><a href=\"/show.html\">Display Text</a> <br> <a href=\"/queue.html\">Queue management</a>");
+        display.clearDisplay();
+        printText(ip,0,0,0,myWHITE);
+      });
 
 
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    server.on("/show.html", HTTP_GET, [&](AsyncWebServerRequest *request){
+      request->send(200, "text/html","<html><form action=\"display.html\" method=\"get\"> \
+    <label for=\"text\">Text:</label> \
+                <input type=\"text\" name=\"text\"><br><br> \
+                <label for=\"size\">Size:</label> \
+  <select name=\"size\"> \
+	<option value=\"1\" selected>1</option> \
+	<option value=\"2\">2</option> \
+	<option value=\"3\">3</option> \
+  </select>  \
+  <br><br>  \
+  \
+  <label for=\"x\">Position X:</label> \
+  <input type=\"text\" size=2 name=\"x\"><br><br> \
+  <label for=\"y\">Position Y:</label> \
+  <input type=\"text\" size=2 name=\"y\"><br><br> \
+  \
+  <label for=\"color\">Color:</label> \
+  <select name=\"color\"> \
+	<option value=\"WHITE\">White</option> \
+	<option value=\"BLUE\">Blue</option> \
+	<option value=\"YELLOW\">Yellow</option> \
+	<option value=\"GREEN\">Green</option> \
+	<option value=\"RED\" selected>Red</option> \
+  </select> \
+  <br><br> \
+  <input type=\"submit\" value=\"Submit\"> \
+  </form> \
+  <a href=\"/\">GO HOME</a>\
+</html>");
+    });
+
+
+
+server.on("/queue.html", HTTP_GET, [&](AsyncWebServerRequest *request){
+
+       int paramsNr = request->params();
+       Serial.print("Number of passed parameters: ");
+       Serial.println(paramsNr);
+
+      if (paramsNr == 0) {
+
+      } else {
+          for(int i=0;i<paramsNr;i++){
+            AsyncWebParameter* p = request->getParam(i);
+            if (p->name() == "counter") {
+                if (p->value() == "previous") {
+                  EEPROM.write(0, --counter);
+                } else if (p->value() == "next") {
+                  EEPROM.write(0, ++counter);
+                }
+                EEPROM.commit();
+            } else if (p->name() == "set") {
+              uint16_t setValue = atoi(p->value().c_str());
+              if (setValue>99 || setValue<0) {
+                Error = Error + "Counter out of range <0-99>. <br>";
+              } else {
+                counter = setValue;
+                EEPROM.write(0,counter);
+                EEPROM.commit();
+              } 
+            } else if (p->name() == "series") {
+              String setValue = p->value();
+              boolean valid=false;
+              for (int j=0;j<10;j++){
+                if (toUpperCase(setValue[0]) == series[j]) {
+                  valid=true;
+                  series_n = j;
+                }
+              }
+              if (!valid) {
+                Error = Error + "invalid series ID <A-J>";
+              }
+            } else if (p->name() == "call") {
+              uint16_t callOnce = atoi(p->value().c_str());
+              if (callOnce>99) callOnce = counter;
+              showDSP = callOnce;
+              callOnce_b = true;
+            }
+
+          }
+      }
+      
+      if (counter>99) {
+        counter=0;
+        if (series_n<9) {
+          EEPROM.write(1,series_n++);
+          EEPROM.commit();
+        } else {
+          EEPROM.write(1,series_n=0);
+          EEPROM.commit();
+        }
+      }
+
+      if (!callOnce_b) {
+        // format counter to include leading zeroes
+        showDSP = counter; 
+        if (counter<10) showDSP = "0" + showDSP;
+      }
+      callOnce_b = false;
+
+      
+
+      String html_main = series[series_n] + showDSP;
+      request->send(200, "text/html",html_main);
+
+      display.clearDisplay();
+      Serial.print("Counter: ");
+      Serial.println(series[series_n] + showDSP);
+      display.setCursor(5,5);
+      display.setTextColor(myRED);
+      display.setTextSize(3);
+      display.print(series[series_n] + showDSP);
+
+    }); 
+
+
+
+    server.on("/display.html", HTTP_GET, [](AsyncWebServerRequest *request){
        int paramsNr = request->params();
        Serial.print("Number of passed parameters: ");
        Serial.println(paramsNr);
@@ -240,14 +400,16 @@ void setup() {
         if (b_text) {
           printText(text,Xpos,Ypos,Size,Color);
         } else {
-          printText(IpAddress2String(WiFi.localIP()),0,0,0,myWHITE);
+          printText(ip,0,0,0,myWHITE);
           Error = Error + "No text sent. Displaying IP address of the device. <br>";
 
         }
         
         if (Error.length()==0) {
-          request->send(200, "text/html", "OK");
+          request->send(200, "text/html", "OK <br>\
+          <a href=\"/show.html\">GO BACK</a>");
         } else {
+          Error = Error + "<br><a href=\"/show.html\">GO BACK</a>";
           request->send(200, "text/html", Error);
         }
 
@@ -293,6 +455,11 @@ void loop() {
       display_updater();
     }
 
-
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) 
+  {
+    previousMillis = currentMillis;
+    udp.broadcastTo(ip.c_str(), 19700);
+  }
 
 }
